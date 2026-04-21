@@ -1,27 +1,146 @@
-//go:build !ios && !iossimulator
-// +build !ios,!iossimulator
+//go:build darwin && !ios && !iossimulator
+// +build darwin,!ios,!iossimulator
 
 package ieproxy
-
-/*
-#cgo LDFLAGS: -framework CoreFoundation
-#cgo LDFLAGS: -framework CFNetwork
-#include <strings.h>
-#include <CFNetwork/CFProxySupport.h>
-*/
-import "C"
 
 import (
 	"fmt"
 	"strings"
 	"sync"
 	"unsafe"
+
+	"github.com/ebitengine/purego"
 )
 
 var once sync.Once
 var darwinProxyConf ProxyConf
 
-// GetConf retrieves the proxy configuration from the Windows Regedit
+var (
+	libCoreFoundation uintptr
+	libCFNetwork      uintptr
+
+	// CoreFoundation functions
+	pCFRelease                          func(uintptr)
+	pCFDictionaryGetValue               func(uintptr, uintptr) uintptr
+	pCFNumberGetValue                   func(uintptr, int32, unsafe.Pointer) bool
+	pCFStringGetCString                 func(uintptr, *byte, int64, uint32) bool
+	pCFStringGetLength                  func(uintptr) int64
+	pCFStringGetMaximumSizeForEncoding  func(int64, uint32) int64
+	pCFArrayGetCount                    func(uintptr) int64
+	pCFArrayGetValueAtIndex             func(uintptr, int64) uintptr
+
+	// CFNetwork functions
+	pCFNetworkCopySystemProxySettings func() uintptr
+
+	// CF string key constants (retrieved as pointer-to-pointer from dylib)
+	pkCFNetworkProxiesHTTPEnable               uintptr
+	pkCFNetworkProxiesHTTPProxy                uintptr
+	pkCFNetworkProxiesHTTPPort                 uintptr
+	pkCFNetworkProxiesHTTPSEnable              uintptr
+	pkCFNetworkProxiesHTTPSProxy               uintptr
+	pkCFNetworkProxiesHTTPSPort                uintptr
+	pkCFNetworkProxiesExceptionsList           uintptr
+	pkCFNetworkProxiesProxyAutoConfigEnable    uintptr
+	pkCFNetworkProxiesProxyAutoConfigURLString uintptr
+)
+
+const kCFStringEncodingUTF8 = 0x08000100
+const kCFNumberIntType = 9
+
+func initLibraries() {
+	var err error
+	libCoreFoundation, err = purego.Dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", purego.RTLD_LAZY|purego.RTLD_GLOBAL)
+	if err != nil {
+		panic("ieproxy: failed to load CoreFoundation: " + err.Error())
+	}
+	libCFNetwork, err = purego.Dlopen("/System/Library/Frameworks/CFNetwork.framework/CFNetwork", purego.RTLD_LAZY|purego.RTLD_GLOBAL)
+	if err != nil {
+		panic("ieproxy: failed to load CFNetwork: " + err.Error())
+	}
+
+	purego.RegisterLibFunc(&pCFRelease, libCoreFoundation, "CFRelease")
+	purego.RegisterLibFunc(&pCFDictionaryGetValue, libCoreFoundation, "CFDictionaryGetValue")
+	purego.RegisterLibFunc(&pCFNumberGetValue, libCoreFoundation, "CFNumberGetValue")
+	purego.RegisterLibFunc(&pCFStringGetCString, libCoreFoundation, "CFStringGetCString")
+	purego.RegisterLibFunc(&pCFStringGetLength, libCoreFoundation, "CFStringGetLength")
+	purego.RegisterLibFunc(&pCFStringGetMaximumSizeForEncoding, libCoreFoundation, "CFStringGetMaximumSizeForEncoding")
+	purego.RegisterLibFunc(&pCFArrayGetCount, libCoreFoundation, "CFArrayGetCount")
+	purego.RegisterLibFunc(&pCFArrayGetValueAtIndex, libCoreFoundation, "CFArrayGetValueAtIndex")
+	purego.RegisterLibFunc(&pCFNetworkCopySystemProxySettings, libCFNetwork, "CFNetworkCopySystemProxySettings")
+
+	pkCFNetworkProxiesHTTPEnable = loadCFStringConst(libCFNetwork, "kCFNetworkProxiesHTTPEnable")
+	pkCFNetworkProxiesHTTPProxy = loadCFStringConst(libCFNetwork, "kCFNetworkProxiesHTTPProxy")
+	pkCFNetworkProxiesHTTPPort = loadCFStringConst(libCFNetwork, "kCFNetworkProxiesHTTPPort")
+	pkCFNetworkProxiesHTTPSEnable = loadCFStringConst(libCFNetwork, "kCFNetworkProxiesHTTPSEnable")
+	pkCFNetworkProxiesHTTPSProxy = loadCFStringConst(libCFNetwork, "kCFNetworkProxiesHTTPSProxy")
+	pkCFNetworkProxiesHTTPSPort = loadCFStringConst(libCFNetwork, "kCFNetworkProxiesHTTPSPort")
+	pkCFNetworkProxiesExceptionsList = loadCFStringConst(libCFNetwork, "kCFNetworkProxiesExceptionsList")
+	pkCFNetworkProxiesProxyAutoConfigEnable = loadCFStringConst(libCFNetwork, "kCFNetworkProxiesProxyAutoConfigEnable")
+	pkCFNetworkProxiesProxyAutoConfigURLString = loadCFStringConst(libCFNetwork, "kCFNetworkProxiesProxyAutoConfigURLString")
+}
+
+// loadCFStringConst returns the CFStringRef stored at the exported symbol (a pointer to a CFStringRef).
+func loadCFStringConst(lib uintptr, name string) uintptr {
+	sym, err := purego.Dlsym(lib, name)
+	if err != nil {
+		panic("ieproxy: symbol not found: " + name + ": " + err.Error())
+	}
+	// sym is the address of the global variable (a CFStringRef*). Dereference once.
+	return *(*uintptr)(unsafe.Pointer(sym))
+}
+
+func cfStringToGoString(cfStr uintptr) string {
+	if cfStr == 0 {
+		return ""
+	}
+	// Size the buffer to fit any UTF-8 encoding of this CFString, plus one
+	// byte for the trailing NUL that CFStringGetCString always writes.
+	maxSize := pCFStringGetMaximumSizeForEncoding(pCFStringGetLength(cfStr), kCFStringEncodingUTF8)
+	if maxSize <= 0 {
+		return ""
+	}
+	buf := make([]byte, maxSize+1)
+	if !pCFStringGetCString(cfStr, &buf[0], int64(len(buf)), kCFStringEncodingUTF8) {
+		return ""
+	}
+	end := 0
+	for end < len(buf) && buf[end] != 0 {
+		end++
+	}
+	return string(buf[:end])
+}
+
+func cfNumberGetInt(cfNum uintptr) int {
+	if cfNum == 0 {
+		return 0
+	}
+	var val int32
+	pCFNumberGetValue(cfNum, kCFNumberIntType, unsafe.Pointer(&val))
+	return int(val)
+}
+
+func cfArrayGetStrings(cfArray uintptr) []string {
+	if cfArray == 0 {
+		return nil
+	}
+	count := pCFArrayGetCount(cfArray)
+	result := make([]string, 0, count)
+	for i := int64(0); i < count; i++ {
+		elem := pCFArrayGetValueAtIndex(cfArray, i)
+		if elem != 0 {
+			result = append(result, cfStringToGoString(elem))
+		}
+	}
+	return result
+}
+
+var libsOnce sync.Once
+
+func ensureLibs() {
+	libsOnce.Do(initLibraries)
+}
+
+// GetConf retrieves the proxy configuration from the macOS System Settings.
 func getConf() ProxyConf {
 	once.Do(writeConf)
 	return darwinProxyConf
@@ -33,76 +152,51 @@ func reloadConf() ProxyConf {
 	return getConf()
 }
 
-func cfStringGetGoString(cfStr C.CFStringRef) string {
-	retCString := (*C.char)(C.calloc(C.ulong(uint(128)), 1))
-	defer C.free(unsafe.Pointer(retCString))
-
-	C.CFStringGetCString(cfStr, retCString, C.long(128), C.kCFStringEncodingUTF8)
-	return C.GoString(retCString)
-}
-
-func cfNumberGetGoInt(cfNum C.CFNumberRef) int {
-	ret := 0
-	C.CFNumberGetValue(cfNum, C.kCFNumberIntType, unsafe.Pointer(&ret))
-	return ret
-}
-
-func cfArrayGetGoStrings(cfArray C.CFArrayRef) []string {
-	var ret []string
-	for i := 0; i < int(C.CFArrayGetCount(cfArray)); i++ {
-		cfStr := C.CFStringRef(C.CFArrayGetValueAtIndex(cfArray, C.long(i)))
-		if unsafe.Pointer(cfStr) != C.NULL {
-			ret = append(ret, cfStringGetGoString(cfStr))
-		}
-	}
-	return ret
-}
-
 func writeConf() {
-	cfDictProxy := C.CFDictionaryRef(C.CFNetworkCopySystemProxySettings())
-	defer C.CFRelease(C.CFTypeRef(cfDictProxy))
+	ensureLibs()
+
+	cfDictProxy := pCFNetworkCopySystemProxySettings()
+	if cfDictProxy == 0 {
+		return
+	}
+	defer pCFRelease(cfDictProxy)
+
 	darwinProxyConf = ProxyConf{}
 
-	cfNumHttpEnable := C.CFNumberRef(C.CFDictionaryGetValue(cfDictProxy, unsafe.Pointer(C.kCFNetworkProxiesHTTPEnable)))
-	if unsafe.Pointer(cfNumHttpEnable) != C.NULL && cfNumberGetGoInt(cfNumHttpEnable) > 0 {
+	cfNumHttpEnable := pCFDictionaryGetValue(cfDictProxy, pkCFNetworkProxiesHTTPEnable)
+	if cfNumHttpEnable != 0 && cfNumberGetInt(cfNumHttpEnable) > 0 {
 		darwinProxyConf.Static.Active = true
 		if darwinProxyConf.Static.Protocols == nil {
 			darwinProxyConf.Static.Protocols = make(map[string]string)
 		}
-		httpHost := C.CFStringRef(C.CFDictionaryGetValue(cfDictProxy, unsafe.Pointer(C.kCFNetworkProxiesHTTPProxy)))
-		httpPort := C.CFNumberRef(C.CFDictionaryGetValue(cfDictProxy, unsafe.Pointer(C.kCFNetworkProxiesHTTPPort)))
-
-		httpProxy := fmt.Sprintf("%s:%d", cfStringGetGoString(httpHost), cfNumberGetGoInt(httpPort))
-		darwinProxyConf.Static.Protocols["http"] = httpProxy
+		httpHost := pCFDictionaryGetValue(cfDictProxy, pkCFNetworkProxiesHTTPProxy)
+		httpPort := pCFDictionaryGetValue(cfDictProxy, pkCFNetworkProxiesHTTPPort)
+		darwinProxyConf.Static.Protocols["http"] = fmt.Sprintf("%s:%d", cfStringToGoString(httpHost), cfNumberGetInt(httpPort))
 	}
 
-	cfNumHttpsEnable := C.CFNumberRef(C.CFDictionaryGetValue(cfDictProxy, unsafe.Pointer(C.kCFNetworkProxiesHTTPSEnable)))
-	if unsafe.Pointer(cfNumHttpsEnable) != C.NULL && cfNumberGetGoInt(cfNumHttpsEnable) > 0 {
+	cfNumHttpsEnable := pCFDictionaryGetValue(cfDictProxy, pkCFNetworkProxiesHTTPSEnable)
+	if cfNumHttpsEnable != 0 && cfNumberGetInt(cfNumHttpsEnable) > 0 {
 		darwinProxyConf.Static.Active = true
 		if darwinProxyConf.Static.Protocols == nil {
 			darwinProxyConf.Static.Protocols = make(map[string]string)
 		}
-		httpsHost := C.CFStringRef(C.CFDictionaryGetValue(cfDictProxy, unsafe.Pointer(C.kCFNetworkProxiesHTTPSProxy)))
-		httpsPort := C.CFNumberRef(C.CFDictionaryGetValue(cfDictProxy, unsafe.Pointer(C.kCFNetworkProxiesHTTPSPort)))
-
-		httpProxy := fmt.Sprintf("%s:%d", cfStringGetGoString(httpsHost), cfNumberGetGoInt(httpsPort))
-		darwinProxyConf.Static.Protocols["https"] = httpProxy
+		httpsHost := pCFDictionaryGetValue(cfDictProxy, pkCFNetworkProxiesHTTPSProxy)
+		httpsPort := pCFDictionaryGetValue(cfDictProxy, pkCFNetworkProxiesHTTPSPort)
+		darwinProxyConf.Static.Protocols["https"] = fmt.Sprintf("%s:%d", cfStringToGoString(httpsHost), cfNumberGetInt(httpsPort))
 	}
 
 	if darwinProxyConf.Static.Active {
-		cfArrayExceptionList := C.CFArrayRef(C.CFDictionaryGetValue(cfDictProxy, unsafe.Pointer(C.kCFNetworkProxiesExceptionsList)))
-		if unsafe.Pointer(cfArrayExceptionList) != C.NULL {
-			exceptionList := cfArrayGetGoStrings(cfArrayExceptionList)
-			darwinProxyConf.Static.NoProxy = strings.Join(exceptionList, ",")
+		cfArrayExceptions := pCFDictionaryGetValue(cfDictProxy, pkCFNetworkProxiesExceptionsList)
+		if cfArrayExceptions != 0 {
+			darwinProxyConf.Static.NoProxy = strings.Join(cfArrayGetStrings(cfArrayExceptions), ",")
 		}
 	}
 
-	cfNumPacEnable := C.CFNumberRef(C.CFDictionaryGetValue(cfDictProxy, unsafe.Pointer(C.kCFNetworkProxiesProxyAutoConfigEnable)))
-	if unsafe.Pointer(cfNumPacEnable) != C.NULL && cfNumberGetGoInt(cfNumPacEnable) > 0 {
-		cfStringPac := C.CFStringRef(C.CFDictionaryGetValue(cfDictProxy, unsafe.Pointer(C.kCFNetworkProxiesProxyAutoConfigURLString)))
-		if unsafe.Pointer(cfStringPac) != C.NULL {
-			pac := cfStringGetGoString(cfStringPac)
-			darwinProxyConf.Automatic.PreConfiguredURL = pac
+	cfNumPacEnable := pCFDictionaryGetValue(cfDictProxy, pkCFNetworkProxiesProxyAutoConfigEnable)
+	if cfNumPacEnable != 0 && cfNumberGetInt(cfNumPacEnable) > 0 {
+		cfStringPac := pCFDictionaryGetValue(cfDictProxy, pkCFNetworkProxiesProxyAutoConfigURLString)
+		if cfStringPac != 0 {
+			darwinProxyConf.Automatic.PreConfiguredURL = cfStringToGoString(cfStringPac)
 			darwinProxyConf.Automatic.Active = true
 		}
 	}
@@ -110,7 +204,7 @@ func writeConf() {
 
 // OverrideEnvWithStaticProxy writes new values to the
 // http_proxy, https_proxy and no_proxy environment variables.
-// The values are taken from the MacOS System Preferences.
+// The values are taken from the macOS System Settings.
 func overrideEnvWithStaticProxy(conf ProxyConf, setenv envSetter) {
 	if conf.Static.Active {
 		for _, scheme := range []string{"http", "https"} {
