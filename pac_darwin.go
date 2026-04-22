@@ -6,6 +6,7 @@ package ieproxy
 import (
 	"fmt"
 	"net/url"
+	"runtime"
 	"sync"
 	"unsafe"
 
@@ -34,11 +35,21 @@ var (
 	pkCFProxyTypeHTTPS     uintptr
 	pkCFProxyHostNameKey   uintptr
 	pkCFProxyPortNumberKey uintptr
-	pkCFRunLoopCommonModes uintptr
 
 	// Private run loop mode string (created once)
 	goIEProxyRunLoopMode uintptr
+
+	// Callback trampoline for CFNetworkExecuteProxyAutoConfigurationURL (created once at init).
+	pacCallback uintptr
 )
+
+type cfStreamClientContext struct {
+	version         int64
+	info            uintptr
+	retain          uintptr
+	release         uintptr
+	copyDescription uintptr
+}
 
 func initPACLibraries() {
 	// CoreFoundation functions
@@ -61,11 +72,19 @@ func initPACLibraries() {
 	pkCFProxyTypeHTTPS = loadCFStringConst(libCFNetwork, "kCFProxyTypeHTTPS")
 	pkCFProxyHostNameKey = loadCFStringConst(libCFNetwork, "kCFProxyHostNameKey")
 	pkCFProxyPortNumberKey = loadCFStringConst(libCFNetwork, "kCFProxyPortNumberKey")
-	pkCFRunLoopCommonModes = loadCFStringConst(libCoreFoundation, "kCFRunLoopCommonModes")
 
-	// Create the private run loop mode string once
 	modeBytes := []byte("go-ieproxy\x00")
 	goIEProxyRunLoopMode = pCFStringCreateWithCString(0, &modeBytes[0], kCFStringEncodingUTF8)
+
+	pacCallback = purego.NewCallback(func(client uintptr, proxies uintptr, cfError uintptr) {
+		result := (*uintptr)(unsafe.Pointer(client))
+		if cfError != 0 {
+			*result = pCFRetain(cfError)
+		} else {
+			*result = pCFRetain(proxies)
+		}
+		pCFRunLoopStop(pCFRunLoopGetCurrent())
+	})
 }
 
 var pacLibsInitOnce sync.Once
@@ -75,10 +94,33 @@ func ensurePACLibs() {
 	pacLibsInitOnce.Do(initPACLibraries)
 }
 
-// pacCallbackState holds the result from the async PAC callback.
-type pacCallbackState struct {
-	result  uintptr
-	runLoop uintptr
+// executePACLookup calls CFNetworkExecuteProxyAutoConfigurationURL on the
+// calling goroutine's OS thread. LockOSThread ensures that CFRunLoopGetCurrent
+// returns the same run loop for both the setup calls and the callback.
+func executePACLookup(pacUrl, reqUrl uintptr) uintptr {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	var cfResult uintptr
+	ctx := cfStreamClientContext{
+		version: 0,
+		info:    uintptr(unsafe.Pointer(&cfResult)),
+	}
+
+	rl := pCFRunLoopGetCurrent()
+	runLoopSrc := pCFNetworkExecuteProxyAutoConfigurationURL(
+		pacUrl, reqUrl, pacCallback, uintptr(unsafe.Pointer(&ctx)),
+	)
+	if runLoopSrc == 0 {
+		return 0
+	}
+
+	pCFRunLoopAddSource(rl, runLoopSrc, goIEProxyRunLoopMode)
+	pCFRunLoopRunInMode(goIEProxyRunLoopMode, 1e308 /* DBL_MAX */, false)
+	pCFRunLoopRemoveSource(rl, runLoopSrc, goIEProxyRunLoopMode)
+	pCFRelease(runLoopSrc)
+
+	return cfResult
 }
 
 func (psc *ProxyScriptConf) findProxyForURL(URL string) string {
@@ -133,46 +175,8 @@ func getProxyForURL(pacFileURL, targetURL string) string {
 		return ""
 	}
 
-	state := &pacCallbackState{}
-	state.runLoop = pCFRunLoopGetCurrent()
+	result := executePACLookup(pacUrl, reqUrl)
 
-	// CFStreamClientContext: version=0, info=pointer-to-state, retain=nil, release=nil, copyDescription=nil
-	type cfStreamClientContext struct {
-		version         int64
-		info            uintptr
-		retain          uintptr
-		release         uintptr
-		copyDescription uintptr
-	}
-	ctx := cfStreamClientContext{
-		version: 0,
-		info:    uintptr(unsafe.Pointer(state)),
-	}
-
-	// Create the callback using purego.NewCallback.
-	// Signature: func(client uintptr, proxies uintptr, error uintptr)
-	cb := purego.NewCallback(func(client uintptr, proxies uintptr, cfError uintptr) {
-		s := (*pacCallbackState)(unsafe.Pointer(client))
-		if cfError != 0 {
-			s.result = pCFRetain(cfError)
-		} else {
-			s.result = pCFRetain(proxies)
-		}
-		pCFRunLoopStop(s.runLoop)
-	})
-
-	runLoopSrc := pCFNetworkExecuteProxyAutoConfigurationURL(
-		pacUrl, reqUrl, cb, uintptr(unsafe.Pointer(&ctx)),
-	)
-	if runLoopSrc == 0 {
-		return ""
-	}
-
-	pCFRunLoopAddSource(state.runLoop, runLoopSrc, goIEProxyRunLoopMode)
-	pCFRunLoopRunInMode(goIEProxyRunLoopMode, 1e308 /* DBL_MAX */, false)
-	pCFRunLoopRemoveSource(state.runLoop, runLoopSrc, pkCFRunLoopCommonModes)
-
-	result := state.result
 	if result == 0 {
 		return ""
 	}
